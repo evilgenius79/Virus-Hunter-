@@ -32,10 +32,15 @@ adds itself to Windows startup.
    `autorun.inf`, and malicious `.lnk` decoy shortcuts.
 7. **Deletes** the known malicious folders/files and the executables of the
    processes it terminated.
-8. **Repairs Explorer** so hidden files and extensions show again, then
-   **un-hides** files the malware marked Hidden/System (it only clears the
-   attributes — it never deletes your data).
-9. **Writes a detailed log** to your Desktop.
+8. **Repairs the hosts file** — removes entries that blackhole antivirus or
+   Windows-update domains (a backup of the original is saved first).
+9. **(Optional) Confirms via VirusTotal** — with `-VirusTotalApiKey`, looks up
+   the SHA256 of each detected file and logs its detection ratio. Read-only; it
+   never changes what the tool deletes.
+10. **Repairs Explorer** so hidden files and extensions show again, then
+    **un-hides** files the malware marked Hidden/System (it only clears the
+    attributes — it never deletes your data).
+11. **Writes a detailed log** to your Desktop.
 
 ## How to run it safely (step by step for a layperson)
 
@@ -87,6 +92,7 @@ adds itself to Windows startup.
 | `-LogPath <path>` | Where to write the log (defaults to the Desktop). |
 | `-ScanRemovableDrives` | Also scan USB drive roots for droppers (on by default). |
 | `-NoRestorePoint` | Skip creating the System Restore checkpoint on live runs. |
+| `-VirusTotalApiKey <key>` | Optional. Look up detected files' SHA256 on VirusTotal and log the detection ratio (read-only). |
 
 ## Disclaimer
 

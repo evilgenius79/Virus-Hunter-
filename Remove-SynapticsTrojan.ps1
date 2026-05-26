@@ -32,9 +32,13 @@
       8. Removes malicious .lnk files from the Startup folders.
       9. Cleans the Excel XLSTART folders and repairs the Office macro-security
          keys (AccessVBOM / VBAWarnings) the worm lowers.
-     10. Repairs the Explorer "hide files" settings and un-hides files the worm
+     10. Removes hosts-file entries that blackhole antivirus / Windows-update
+         domains (backing the file up first).
+     11. (Optional) Looks up the SHA256 of detected files on VirusTotal for
+         confirmation - read-only, requires -VirusTotalApiKey.
+     12. Repairs the Explorer "hide files" settings and un-hides files the worm
          marked Hidden/System.
-     11. Writes a detailed, timestamped text log.
+     13. Writes a detailed, timestamped text log.
 
     SAFETY: Run with -DryRun first. In DryRun mode nothing is changed.
 
@@ -50,6 +54,11 @@
 
 .PARAMETER NoRestorePoint
     Skip creation of the System Restore checkpoint on live runs.
+
+.PARAMETER VirusTotalApiKey
+    Optional VirusTotal API key. When supplied, the SHA256 of each detected file
+    is looked up on VirusTotal and the detection ratio is logged. This is purely
+    informational (read-only) and never changes what the tool deletes.
 
 .EXAMPLE
     PS> .\Remove-SynapticsTrojan.ps1 -DryRun
@@ -69,7 +78,8 @@ param(
     [switch]$DryRun,
     [string]$LogPath = (Join-Path ([Environment]::GetFolderPath('Desktop')) ("SynapticsTrojan-Cleanup_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))),
     [switch]$ScanRemovableDrives = $true,
-    [switch]$NoRestorePoint
+    [switch]$NoRestorePoint,
+    [string]$VirusTotalApiKey
 )
 
 # ----------------------------------------------------------------------------
@@ -102,6 +112,19 @@ $RunKeys = @(
 )
 
 $WinlogonKey = 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
+
+# The hosts file, and domain fragments malware commonly blackholes to stop
+# antivirus / OS updates. A line that maps one of these to a loopback / null
+# address is treated as a malicious block.
+$HostsFile = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+$SinkholeAddresses = @('0.0.0.0', '127.0.0.1', '::1', '::')
+$SecurityDomains = @(
+    'microsoft.com', 'windowsupdate.com', 'update.microsoft', 'msftncsi.com',
+    'defender', 'mpwsystem',
+    'avast.com', 'avg.com', 'avira', 'bitdefender', 'eset', 'nod32',
+    'kaspersky', 'mcafee', 'norton', 'symantec', 'sophos', 'malwarebytes',
+    'trendmicro', 'f-secure', 'drweb', 'comodo', 'clamav', 'virustotal.com'
+)
 
 # ----------------------------------------------------------------------------
 # Logging helpers
@@ -675,6 +698,98 @@ function Restore-HiddenItems {
 }
 
 # ----------------------------------------------------------------------------
+# Step 11 - Hosts file repair
+# ----------------------------------------------------------------------------
+
+function Repair-HostsFile {
+    Write-Log "Checking the hosts file for malicious security/update blocks..." -Level INFO
+    if (-not (Test-Path -LiteralPath $HostsFile)) { Write-Log "Hosts file not found." -Level WARN; return }
+
+    $lines = $null
+    try { $lines = Get-Content -LiteralPath $HostsFile -ErrorAction Stop }
+    catch { Write-Log "Could not read hosts file: $($_.Exception.Message)" -Level WARN; return }
+
+    $bad  = New-Object System.Collections.Generic.List[string]
+    $keep = New-Object System.Collections.Generic.List[string]
+
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { $keep.Add($line); continue }
+
+        $tokens = $trimmed -split '\s+'
+        if ($tokens.Count -lt 2) { $keep.Add($line); continue }
+        $ip = $tokens[0]
+        $hosts = $tokens[1..($tokens.Count - 1)] -join ' '
+
+        $isSinkhole  = $SinkholeAddresses -contains $ip
+        $hitsSecurity = $false
+        foreach ($d in $SecurityDomains) { if ($hosts -match [regex]::Escape($d)) { $hitsSecurity = $true; break } }
+
+        if ($isSinkhole -and $hitsSecurity) {
+            $bad.Add($line)
+            Write-Log "Malicious hosts entry (blocks security/update): $trimmed" -Level FOUND
+        }
+        else {
+            $keep.Add($line)
+        }
+    }
+
+    if ($bad.Count -eq 0) { Write-Log "No malicious hosts entries found." -Level OK; return }
+
+    if ($DryRun) {
+        Write-Log "WOULD back up the hosts file and remove $($bad.Count) malicious entr$(if($bad.Count -eq 1){'y'}else{'ies'})." -Level ACTION
+        return
+    }
+    try {
+        $backup = "$HostsFile.bak_{0:yyyyMMdd_HHmmss}" -f (Get-Date)
+        Copy-Item -LiteralPath $HostsFile -Destination $backup -Force -ErrorAction Stop
+        Set-Content -LiteralPath $HostsFile -Value $keep -Encoding ASCII -ErrorAction Stop
+        Write-Log "Removed $($bad.Count) malicious hosts entr$(if($bad.Count -eq 1){'y'}else{'ies'}). Backup: $backup" -Level OK
+    }
+    catch {
+        Write-Log "FAILED to repair hosts file: $($_.Exception.Message)" -Level ERROR
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Step 12 - Optional VirusTotal hash lookup (read-only, informational)
+# ----------------------------------------------------------------------------
+
+function Invoke-VirusTotalLookup {
+    param([System.Collections.Generic.IEnumerable[string]]$Paths)
+    if ([string]::IsNullOrWhiteSpace($VirusTotalApiKey)) { return }
+
+    Write-Log "Querying VirusTotal for detected files (informational only)..." -Level INFO
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($path in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) { continue }
+        $hash = $null
+        try { $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash } catch { continue }
+        if (-not $seen.Add($hash)) { continue }
+
+        try {
+            $resp = Invoke-RestMethod -Method Get `
+                -Uri "https://www.virustotal.com/api/v3/files/$hash" `
+                -Headers @{ 'x-apikey' = $VirusTotalApiKey } `
+                -ErrorAction Stop
+            $stats = $resp.data.attributes.last_analysis_stats
+            $mal = [int]$stats.malicious
+            $total = ([int]$stats.malicious + [int]$stats.suspicious + [int]$stats.undetected + [int]$stats.harmless)
+            Write-Log "VirusTotal: $mal/$total engines flag '$path' (SHA256 $hash)." -Level FOUND
+        }
+        catch {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 404) {
+                Write-Log "VirusTotal: hash for '$path' is unknown to VT (SHA256 $hash)." -Level INFO
+            }
+            else {
+                Write-Log "VirusTotal lookup failed for '$path': $($_.Exception.Message)" -Level WARN
+            }
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -694,11 +809,19 @@ function Invoke-Cleanup {
     $suspectPaths = Stop-MaliciousProcesses
     Remove-MaliciousScheduledTasks
     Remove-MaliciousServices
+
+    # VirusTotal lookup runs BEFORE deletion so the files still exist on disk.
+    $vtTargets = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $suspectPaths) { $vtTargets.Add($p) }
+    foreach ($p in $KnownMaliciousPaths) { if (Test-Path -LiteralPath $p) { $vtTargets.Add($p) } }
+    Invoke-VirusTotalLookup -Paths $vtTargets
+
     Remove-MaliciousFiles -ExtraPaths $suspectPaths
     Clear-RemovableDrives
     Remove-MaliciousRunKeys
     Remove-MaliciousStartupShortcuts
     Clear-OfficePersistence
+    Repair-HostsFile
     Repair-HiddenFileSettings
     Restore-HiddenItems
 
