@@ -5,24 +5,37 @@ malware family that disguises itself as the legitimate Synaptics touchpad driver
 spreads via USB drives and infected Office documents, hides your real files, and
 adds itself to Windows startup.
 
-> **Important:** The *genuine* Synaptics driver lives in
-> `C:\Program Files\Synaptics\`. This tool treats that location as trusted and
-> **never** touches it. It only acts on copies running or stored in the usual
-> malware locations (`C:\ProgramData\Synaptics`, `C:\Users\Public\`, AppData,
-> and the root of USB drives).
+> **How it decides what's malicious (trust model):** a file matching the
+> malware's names is treated as **genuine only if it carries a valid
+> Authenticode signature from "Synaptics."** This is stronger than trusting a
+> file just because it lives in `C:\Program Files\Synaptics\` — it catches
+> malware that drops *into* Program Files, and avoids deleting a legitimately
+> signed file found elsewhere. As an extra guard, the tool will **never delete**
+> anything inside `C:\Program Files\Synaptics\`.
 
 ## What it does
 
 1. **Requires Administrator rights** and refuses to run without them.
-2. **Finds and kills** `Synaptics` / `wszui.exe` processes that run from outside
-   `C:\Program Files\Synaptics\`.
-3. **Deletes** the known malicious folders/files and hidden `Synaptics*.exe`
-   droppers on the root of removable (USB) drives.
-4. **Cleans the registry** — removes malicious startup entries from the `Run`
-   keys under `HKCU` and `HKLM`.
-5. **Repairs Explorer** so hidden files and file extensions show again, then
-   **un-hides** files the malware marked Hidden/System.
-6. **Writes a detailed log** to your Desktop.
+2. **Creates a System Restore checkpoint** first (on live runs), so you can roll
+   back if needed.
+3. **Finds and kills** `Synaptics` / `wszui` / `wszqms` / `wszust` processes that
+   are *not* validly signed by Synaptics.
+4. **Removes persistence** beyond the basics:
+   - Malicious **scheduled tasks** and **services**.
+   - Registry **`Run` and `RunOnce`** entries under `HKCU` and `HKLM`.
+   - Hijacked **Winlogon** `Shell` / `Userinit` values (repaired to defaults).
+   - Malicious **Startup-folder** shortcuts.
+5. **Cleans the Office/Excel infection vector** — removes malicious files from
+   the **XLSTART** folders and resets the macro-security keys (`AccessVBOM`,
+   `VBAWarnings`) the worm lowers. Without this, Excel can reinfect the machine.
+6. **Cleans removable (USB) drives** — hidden `Synaptics*.exe` droppers,
+   `autorun.inf`, and malicious `.lnk` decoy shortcuts.
+7. **Deletes** the known malicious folders/files and the executables of the
+   processes it terminated.
+8. **Repairs Explorer** so hidden files and extensions show again, then
+   **un-hides** files the malware marked Hidden/System (it only clears the
+   attributes — it never deletes your data).
+9. **Writes a detailed log** to your Desktop.
 
 ## How to run it safely (step by step for a layperson)
 
@@ -73,6 +86,7 @@ adds itself to Windows startup.
 | `-DryRun` | Report-only. Makes **no** changes. Use this first. |
 | `-LogPath <path>` | Where to write the log (defaults to the Desktop). |
 | `-ScanRemovableDrives` | Also scan USB drive roots for droppers (on by default). |
+| `-NoRestorePoint` | Skip creating the System Restore checkpoint on live runs. |
 
 ## Disclaimer
 
