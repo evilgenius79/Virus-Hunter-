@@ -1,5 +1,7 @@
 # Synaptics.exe Trojan Removal Tool
 
+[![validate](https://github.com/evilgenius79/Virus-Hunter-/actions/workflows/validate.yml/badge.svg)](https://github.com/evilgenius79/Virus-Hunter-/actions/workflows/validate.yml)
+
 A defensive PowerShell remediation script for the **"Synaptics.exe" trojan**
 (also known as **Xred**) — a malware family that disguises itself as the
 legitimate Synaptics touchpad driver, **infects your other programs** (keeping
@@ -26,7 +28,10 @@ like Jenxcus/Houdini and Gamarue.
 2. **Creates a System Restore checkpoint** first (on live runs), so you can roll
    back if needed.
 3. **Finds and kills** `Synaptics` / `wszui` / `wszqms` / `wszust` processes that
-   are *not* validly signed by Synaptics.
+   are *not* validly signed by Synaptics — sweeping repeatedly, because these
+   worms often run as watchdog pairs that restart each other. Files it can't
+   delete because they're still locked are **scheduled for deletion at the next
+   reboot**.
 4. **Repairs infected programs** — where Xred wrapped one of your `.exe` files
    and kept the clean original as `._cache_<name>.exe`, the infected file is
    replaced with the clean copy, so you get your program back instead of losing
@@ -45,7 +50,9 @@ like Jenxcus/Houdini and Gamarue.
 7. **Cleans removable (USB) drives** — unsigned `Synaptics*.exe` droppers,
    `autorun.inf`, decoy `.lnk` shortcuts (including ones masquerading as your
    hidden folders or launching script hosts), hidden script droppers, and
-   "folder-icon" worm copies named after real folders.
+   "folder-icon" worm copies named after real folders. USB *hard drives* show
+   up to Windows as fixed disks, not removable — add them with
+   `-AlsoScanDrives D,E`.
 8. **Deletes** the known malicious folders/files and the executables of the
    processes it terminated.
 9. **Repairs the hosts file** — removes entries that blackhole antivirus or
@@ -108,8 +115,42 @@ like Jenxcus/Houdini and Gamarue.
 | `-DryRun` | Report-only. Makes **no** changes. Use this first. |
 | `-LogPath <path>` | Where to write the log (defaults to the Desktop). |
 | `-ScanRemovableDrives` | Also scan USB drive roots for droppers (on by default). |
+| `-AlsoScanDrives D,E` | Extra drive letters to treat like removable drives (USB hard drives report as fixed disks). The system drive is refused. |
 | `-NoRestorePoint` | Skip creating the System Restore checkpoint on live runs. |
 | `-VirusTotalApiKey <key>` | Optional. Look up detected files' SHA256 on VirusTotal and log the detection ratio (read-only). |
+
+## Exit codes
+
+The script's exit code tells you the outcome at a glance (useful for scheduled
+runs and technicians):
+
+| Code | Meaning |
+|---|---|
+| `0` | Nothing malicious found. |
+| `1` | Not run as Administrator — nothing was scanned. |
+| `2` | Infections were found (and removed, unless `-DryRun`). Check the log. |
+| `3` | One or more errors occurred — read the log before assuming the machine is clean. |
+
+## Known limitations
+
+- **Infected Office documents are not repaired.** Xred can inject macros into
+  workbooks themselves. Detecting that reliably requires parsing VBA streams,
+  which is beyond a remediation script — after cleanup, re-scan your `.xls` /
+  `.xlsm` files with your antivirus and be suspicious of workbooks that grew in
+  size around the infection date.
+- **`AppData` is not un-hidden.** The un-hide step deliberately skips `AppData`
+  (many things there are legitimately hidden). If the worm hid something there
+  specifically, un-hide it manually.
+- This is a **focused remediation aid, not an antivirus**. Follow up with a
+  full AV scan after rebooting.
+
+## Development & testing
+
+Every push runs a GitHub Actions workflow on a Windows runner that parses the
+script under both Windows PowerShell 5.1 and PowerShell 7, lints it with
+PSScriptAnalyzer, and runs the Pester unit tests in `tests/`. Dot-sourcing the
+script (`. .\Remove-SynapticsTrojan.ps1`) loads its functions without
+performing any cleanup, which is what the tests rely on.
 
 ## Disclaimer
 

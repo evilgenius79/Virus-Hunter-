@@ -27,15 +27,18 @@
       1. Requires Administrator privileges.
       2. (Live runs) Creates a System Restore checkpoint first.
       3. Terminates Synaptics / wszui processes that are NOT validly signed by
-         Synaptics, recording their on-disk paths.
+         Synaptics, recording their on-disk paths - sweeping repeatedly until
+         watchdog pairs that respawn each other stay dead.
       4. Removes malicious scheduled tasks and services.
       5. Deletes known malicious folders/files and the executables of the killed
-         processes.
+         processes. Files locked by running malware are scheduled for deletion
+         at the next reboot.
       6. Repairs Xred-infected executables: where a clean original was kept as
          "._cache_<name>.exe", the infected host is replaced by the clean copy.
-      7. Cleans removable drives: unsigned Synaptics*.exe droppers, autorun.inf,
-         decoy .lnk shortcuts, hidden script droppers, and "folder-icon" worm
-         copies named after hidden real folders.
+      7. Cleans removable drives (plus any drives given via -AlsoScanDrives):
+         unsigned Synaptics*.exe droppers, autorun.inf, decoy .lnk shortcuts,
+         hidden script droppers, and "folder-icon" worm copies named after
+         hidden real folders.
       8. Cleans persistence in the registry: Run, RunOnce, the HKCU Windows
          Load/Run values, and the Winlogon Shell/Userinit values.
       9. Removes malicious .lnk files from the Startup folders.
@@ -49,7 +52,8 @@
          confirmation - read-only, requires -VirusTotalApiKey.
      14. Repairs the Explorer "hide files" settings and un-hides files the worm
          marked Hidden/System.
-     15. Writes a detailed, timestamped text log.
+     15. Writes a detailed, timestamped text log ending with a summary, and
+         returns a meaningful exit code (see NOTES).
 
     SAFETY: Run with -DryRun first. In DryRun mode nothing is changed.
 
@@ -62,6 +66,12 @@
 
 .PARAMETER ScanRemovableDrives
     Also scan the root of removable (USB) drives. Enabled by default.
+
+.PARAMETER AlsoScanDrives
+    Extra drive letters (e.g. 'D','E') to treat like removable drives during
+    the drive cleanup, infected-exe repair, and un-hide steps. Useful for USB
+    hard drives, which Windows reports as fixed disks rather than removable.
+    The system drive is refused here - it is already covered by the other steps.
 
 .PARAMETER NoRestorePoint
     Skip creation of the System Restore checkpoint on live runs.
@@ -82,6 +92,12 @@
 .NOTES
     A remediation aid, not a replacement for a full AV scan. After running it,
     reboot and perform a full scan with a reputable antivirus product.
+
+    Exit codes: 0 = nothing found, 1 = not run as Administrator,
+    2 = infections were found (see the log), 3 = one or more errors occurred.
+
+    Dot-sourcing the script (". .\Remove-SynapticsTrojan.ps1") loads its
+    functions without performing any cleanup - the Pester tests rely on this.
 #>
 
 [CmdletBinding()]
@@ -89,6 +105,7 @@ param(
     [switch]$DryRun,
     [string]$LogPath = (Join-Path ([Environment]::GetFolderPath('Desktop')) ("SynapticsTrojan-Cleanup_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))),
     [switch]$ScanRemovableDrives = $true,
+    [string[]]$AlsoScanDrives,
     [switch]$NoRestorePoint,
     [string]$VirusTotalApiKey
 )
@@ -152,6 +169,7 @@ $SecurityDomains = @(
 # ----------------------------------------------------------------------------
 
 $script:LogLines = New-Object System.Collections.Generic.List[string]
+$script:Stats = @{ FOUND = 0; WARN = 0; ERROR = 0 }
 
 function Write-Log {
     param(
@@ -162,6 +180,7 @@ function Write-Log {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line  = "[{0}] [{1,-6}] {2}" -f $stamp, $Level, $Message
     $script:LogLines.Add($line)
+    if ($script:Stats.ContainsKey($Level)) { $script:Stats[$Level]++ }
     switch ($Level) {
         'FOUND'  { Write-Host $line -ForegroundColor Yellow }
         'ACTION' { Write-Host $line -ForegroundColor Cyan }
@@ -277,6 +296,83 @@ function Test-CommandIsMalicious {
     return $true
 }
 
+function Get-CacheOriginalName {
+    # "._cache_app.exe" -> "app.exe"; $null when the name doesn't match.
+    param([string]$Name)
+    if ($Name -notlike '._cache_*') { return $null }
+    return $Name.Substring(8)
+}
+
+function Test-HostsLineIsMalicious {
+    # True when a hosts-file line maps a security/update domain to a sinkhole
+    # address. Comments, blanks and ordinary entries are never flagged.
+    param([string]$Line)
+    $trimmed = ([string]$Line).Trim()
+    if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { return $false }
+    $tokens = $trimmed -split '\s+'
+    if ($tokens.Count -lt 2) { return $false }
+    if ($SinkholeAddresses -notcontains $tokens[0]) { return $false }
+    $hostNames = $tokens[1..($tokens.Count - 1)] -join ' '
+    foreach ($d in $SecurityDomains) {
+        if ($hostNames -match [regex]::Escape($d)) { return $true }
+    }
+    return $false
+}
+
+$script:MoveFileExType = $null
+function Register-DeleteOnReboot {
+    # Files locked by still-running malware can't be deleted now; MoveFileEx
+    # with MOVEFILE_DELAY_UNTIL_REBOOT (4) queues them for removal at boot.
+    param([string]$Path)
+    try {
+        if (-not $script:MoveFileExType) {
+            $script:MoveFileExType = Add-Type -Name 'Native' -Namespace 'SynapticsCleanup' -PassThru -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+'@
+        }
+        if ($script:MoveFileExType::MoveFileEx($Path, $null, 4)) {
+            Write-Log "Scheduled for deletion at next reboot: $Path" -Level OK
+            return $true
+        }
+    }
+    catch {}
+    Write-Log "Could not schedule reboot-time deletion for: $Path" -Level WARN
+    return $false
+}
+
+$script:ScanDriveRootsCache = $null
+function Get-ScanDriveRoots {
+    # Removable drives (if enabled) plus any -AlsoScanDrives letters. Cached so
+    # repeated callers don't re-query WMI or re-log warnings.
+    if ($null -ne $script:ScanDriveRootsCache) { return ,$script:ScanDriveRootsCache }
+
+    $roots = New-Object System.Collections.Generic.List[string]
+    if ($ScanRemovableDrives) {
+        Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 2' -ErrorAction SilentlyContinue |
+            ForEach-Object { $roots.Add($_.DeviceID + '\') }
+    }
+    foreach ($d in $AlsoScanDrives) {
+        $letter = ($d.TrimEnd(':', '\')).ToUpper()
+        if ($letter -notmatch '^[A-Z]$') {
+            Write-Log "Ignoring invalid -AlsoScanDrives entry '$d' (use a drive letter like 'D')." -Level WARN
+            continue
+        }
+        $root = "${letter}:\"
+        if ($root -eq ($env:SystemDrive + '\')) {
+            Write-Log "Refusing to treat the system drive $root as a worm-target drive; it is covered by the other steps." -Level WARN
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $root)) {
+            Write-Log "-AlsoScanDrives drive $root is not present - skipping." -Level WARN
+            continue
+        }
+        if ($roots -notcontains $root) { $roots.Add($root) }
+    }
+    $script:ScanDriveRootsCache = $roots.ToArray()
+    return ,$script:ScanDriveRootsCache
+}
+
 function Remove-ItemSecurely {
     # Clears protective attributes, then deletes. Honors DryRun. Never touches
     # the genuine driver tree.
@@ -302,7 +398,15 @@ function Remove-ItemSecurely {
         Write-Log "Deleted: $Path" -Level OK
     }
     catch {
-        Write-Log "FAILED to delete '$Path': $($_.Exception.Message)" -Level ERROR
+        Write-Log "FAILED to delete '$Path' (likely locked by a running process): $($_.Exception.Message)" -Level ERROR
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($item) {
+            if ($item.PSIsContainer) {
+                Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+                    ForEach-Object { Register-DeleteOnReboot $_.FullName | Out-Null }
+            }
+            Register-DeleteOnReboot $Path | Out-Null
+        }
     }
 }
 
@@ -329,12 +433,30 @@ function Assert-Administrator {
 function New-RestoreCheckpoint {
     if ($DryRun -or $NoRestorePoint) { return }
     Write-Log "Creating a System Restore checkpoint before making changes..." -Level INFO
+
+    # Windows silently skips checkpoints made within 24h of the previous one;
+    # lift that throttle for this one call, then put the setting back.
+    $srKey    = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    $freqName = 'SystemRestorePointCreationFrequency'
+    $hadValue = $false; $prev = $null
+    try {
+        $prev = (Get-ItemProperty -LiteralPath $srKey -Name $freqName -ErrorAction Stop).$freqName
+        $hadValue = $true
+    } catch {}
+    try { Set-ItemProperty -LiteralPath $srKey -Name $freqName -Value 0 -Type DWord -ErrorAction SilentlyContinue } catch {}
+
     try {
         Checkpoint-Computer -Description 'Before Synaptics trojan cleanup' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
         Write-Log "System Restore checkpoint created." -Level OK
     }
     catch {
-        Write-Log "Could not create a restore point (System Restore may be disabled, or this is a Server OS, or one was created in the last 24h): $($_.Exception.Message)" -Level WARN
+        Write-Log "Could not create a restore point (System Restore may be disabled, or this is a Server OS): $($_.Exception.Message)" -Level WARN
+    }
+    finally {
+        try {
+            if ($hadValue) { Set-ItemProperty -LiteralPath $srKey -Name $freqName -Value $prev -Type DWord -ErrorAction SilentlyContinue }
+            else           { Remove-ItemProperty -LiteralPath $srKey -Name $freqName -ErrorAction SilentlyContinue }
+        } catch {}
     }
 }
 
@@ -343,45 +465,65 @@ function New-RestoreCheckpoint {
 # ----------------------------------------------------------------------------
 
 function Stop-MaliciousProcesses {
+    # These worms often run as watchdog pairs that respawn each other, so a
+    # single kill pass isn't enough: sweep repeatedly until a pass finds no
+    # family process running.
     Write-Log "Scanning running processes for $($TargetProcessNames -join ', ')..." -Level INFO
     $suspectPaths = New-Object System.Collections.Generic.List[string]
+    $maxRounds = 5
 
-    foreach ($name in $TargetProcessNames) {
-        $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
-        if (-not $procs) { Write-Log "No running process named '$name'." -Level INFO; continue }
+    for ($round = 1; $round -le $maxRounds; $round++) {
+        $actedOn = 0
+        foreach ($name in $TargetProcessNames) {
+            foreach ($p in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+                $exePath = $null
+                try { $exePath = $p.Path } catch { $exePath = $null }
 
-        foreach ($p in $procs) {
-            $exePath = $null
-            try { $exePath = $p.Path } catch { $exePath = $null }
-
-            if ($exePath -and (Test-IsGenuineSynaptics $exePath)) {
-                Write-Log "Process '$name' (PID $($p.Id)) at '$exePath' is validly signed by Synaptics - leaving it alone." -Level OK
-                continue
-            }
-
-            if ([string]::IsNullOrWhiteSpace($exePath)) {
-                Write-Log "Process '$name' (PID $($p.Id)) path unreadable - treating as malicious." -Level FOUND
-            }
-            else {
-                $reason = if (Test-IsUnderTrustedRoot $exePath) { 'in Program Files but NOT validly signed' } else { 'untrusted path / signature' }
-                Write-Log "Process '$name' (PID $($p.Id)) at '$exePath' is malicious ($reason)." -Level FOUND
-                $suspectPaths.Add($exePath) | Out-Null
-            }
-
-            if ($DryRun) {
-                Write-Log "WOULD terminate process '$name' (PID $($p.Id))." -Level ACTION
-            }
-            else {
-                try {
-                    Stop-Process -Id $p.Id -Force -ErrorAction Stop
-                    Write-Log "Terminated process '$name' (PID $($p.Id))." -Level OK
+                if ($exePath -and (Test-IsGenuineSynaptics $exePath)) {
+                    if ($round -eq 1) {
+                        Write-Log "Process '$name' (PID $($p.Id)) at '$exePath' is validly signed by Synaptics - leaving it alone." -Level OK
+                    }
+                    continue
                 }
-                catch {
-                    Write-Log "FAILED to terminate '$name' (PID $($p.Id)): $($_.Exception.Message)" -Level ERROR
+
+                if ([string]::IsNullOrWhiteSpace($exePath)) {
+                    Write-Log "Process '$name' (PID $($p.Id)) path unreadable - treating as malicious." -Level FOUND
+                }
+                else {
+                    $reason = if (Test-IsUnderTrustedRoot $exePath) { 'in Program Files but NOT validly signed' } else { 'untrusted path / signature' }
+                    Write-Log "Process '$name' (PID $($p.Id)) at '$exePath' is malicious ($reason)." -Level FOUND
+                    if (-not $suspectPaths.Contains($exePath)) { $suspectPaths.Add($exePath) }
+                }
+
+                $actedOn++
+                if ($DryRun) {
+                    Write-Log "WOULD terminate process '$name' (PID $($p.Id))." -Level ACTION
+                }
+                else {
+                    try {
+                        Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                        Write-Log "Terminated process '$name' (PID $($p.Id))." -Level OK
+                    }
+                    catch {
+                        Write-Log "FAILED to terminate '$name' (PID $($p.Id)): $($_.Exception.Message)" -Level ERROR
+                    }
                 }
             }
         }
+
+        if ($actedOn -eq 0) {
+            if ($round -eq 1) { Write-Log "No malicious family processes are running." -Level INFO }
+            else { Write-Log "No family process reappeared (sweep $round) - the watchdog respawn loop is broken." -Level OK }
+            break
+        }
+        if ($DryRun) { break }   # one reporting pass is enough
+        if ($round -eq $maxRounds) {
+            Write-Log "Family processes still reappearing after $maxRounds sweeps - deletion continues; reboot afterwards and re-run." -Level WARN
+            break
+        }
+        Start-Sleep -Milliseconds 750
     }
+
     # The comma keeps the array intact through PowerShell's pipeline unrolling
     # (an empty or single-element result would otherwise arrive as $null/string).
     return ,$suspectPaths.ToArray()
@@ -469,15 +611,12 @@ function Remove-MaliciousFiles {
 # ----------------------------------------------------------------------------
 
 function Clear-RemovableDrives {
-    if (-not $ScanRemovableDrives) { return }
-    Write-Log "Scanning removable drive roots..." -Level INFO
+    $driveRoots = Get-ScanDriveRoots
+    if (-not $driveRoots) { Write-Log "No removable (or additionally requested) drives to scan." -Level INFO; return }
+    Write-Log "Scanning drive roots for worm droppers..." -Level INFO
 
-    $removable = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 2' -ErrorAction SilentlyContinue
-    if (-not $removable) { Write-Log "No removable drives detected." -Level INFO; return }
-
-    foreach ($drive in $removable) {
-        $root = $drive.DeviceID + '\'
-        Write-Log "Inspecting removable drive root: $root" -Level INFO
+    foreach ($root in $driveRoots) {
+        Write-Log "Inspecting drive root: $root" -Level INFO
 
         # 1) Synaptics*.exe droppers in the root. A validly signed file (e.g. a
         #    driver installer the user stored there) is left alone.
@@ -781,20 +920,18 @@ function Repair-InfectedExecutables {
 
     $roots = New-Object System.Collections.Generic.List[string]
     $roots.Add($env:USERPROFILE)
-    if ($ScanRemovableDrives) {
-        Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 2' -ErrorAction SilentlyContinue |
-            ForEach-Object { $roots.Add($_.DeviceID + '\') }
-    }
+    foreach ($r in (Get-ScanDriveRoots)) { $roots.Add($r) }
 
     $pairs = 0
     foreach ($root in $roots) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
         Get-ChildItem -LiteralPath $root -Filter '._cache_*.exe' -File -Recurse -Force -ErrorAction SilentlyContinue |
             ForEach-Object {
+                $originalName = Get-CacheOriginalName $_.Name
+                if (-not $originalName) { return }
                 $pairs++
-                $cachePath    = $_.FullName
-                $originalName = $_.Name.Substring(8)      # strip "._cache_"
-                $hostPath     = Join-Path $_.DirectoryName $originalName
+                $cachePath = $_.FullName
+                $hostPath  = Join-Path $_.DirectoryName $originalName
 
                 $hostExists = Test-Path -LiteralPath $hostPath
                 if ($hostExists) {
@@ -926,23 +1063,25 @@ function Repair-HiddenFileSettings {
 }
 
 function Restore-HiddenItems {
-    # Clears Hidden/System on user files/USB roots the worm hid. Never deletes.
+    # Clears Hidden/System on user files and scanned drives the worm hid.
+    # Never deletes anything.
     Write-Log "Restoring visibility of files hidden by the malware..." -Level INFO
     $scanRoots = New-Object System.Collections.Generic.List[string]
     $scanRoots.Add($env:USERPROFILE)
-    if ($ScanRemovableDrives) {
-        Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 2' -ErrorAction SilentlyContinue |
-            ForEach-Object { $scanRoots.Add($_.DeviceID + '\') }
-    }
+    foreach ($r in (Get-ScanDriveRoots)) { $scanRoots.Add($r) }
 
     foreach ($root in $scanRoots) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
         Write-Log "Un-hiding items under: $root" -Level INFO
+        $scanned = 0
         Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object {
-                (($_.Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0 -or
-                 ($_.Attributes -band [System.IO.FileAttributes]::System) -ne 0)
-            } | ForEach-Object {
+            ForEach-Object {
+                $scanned++
+                if ($scanned % 500 -eq 0) {
+                    Write-Progress -Activity "Scanning for hidden items" -Status "$scanned items checked under $root"
+                }
+                if ((($_.Attributes -band [System.IO.FileAttributes]::Hidden) -eq 0) -and
+                    (($_.Attributes -band [System.IO.FileAttributes]::System) -eq 0)) { return }
                 if ($_.Name -in @('desktop.ini', 'thumbs.db', 'ntuser.dat')) { return }
                 if ($_.FullName -match '\\(AppData|\.git)\\') { return }
                 if ($DryRun) { Write-Log "WOULD clear Hidden/System on: $($_.FullName)" -Level ACTION }
@@ -955,6 +1094,7 @@ function Restore-HiddenItems {
                     catch { Write-Log "FAILED to clear attributes on '$($_.FullName)': $($_.Exception.Message)" -Level ERROR }
                 }
             }
+        Write-Progress -Activity "Scanning for hidden items" -Completed
     }
 }
 
@@ -974,21 +1114,9 @@ function Repair-HostsFile {
     $keep = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $lines) {
-        $trimmed = $line.Trim()
-        if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { $keep.Add($line); continue }
-
-        $tokens = $trimmed -split '\s+'
-        if ($tokens.Count -lt 2) { $keep.Add($line); continue }
-        $ip = $tokens[0]
-        $hosts = $tokens[1..($tokens.Count - 1)] -join ' '
-
-        $isSinkhole  = $SinkholeAddresses -contains $ip
-        $hitsSecurity = $false
-        foreach ($d in $SecurityDomains) { if ($hosts -match [regex]::Escape($d)) { $hitsSecurity = $true; break } }
-
-        if ($isSinkhole -and $hitsSecurity) {
+        if (Test-HostsLineIsMalicious $line) {
             $bad.Add($line)
-            Write-Log "Malicious hosts entry (blocks security/update): $trimmed" -Level FOUND
+            Write-Log "Malicious hosts entry (blocks security/update): $($line.Trim())" -Level FOUND
         }
         else {
             $keep.Add($line)
@@ -1106,6 +1234,8 @@ function Invoke-Cleanup {
     Restore-HiddenItems
 
     Write-Log "Cleanup finished." -Level INFO
+    Write-Log ("Summary: {0} finding(s), {1} item(s) flagged for manual review, {2} error(s)." -f `
+        $script:Stats.FOUND, $script:Stats.WARN, $script:Stats.ERROR) -Level INFO
     if ($DryRun) {
         Write-Log "This was a DRY RUN. No changes were made. Re-run WITHOUT -DryRun to apply." -Level WARN
     }
@@ -1115,4 +1245,12 @@ function Invoke-Cleanup {
     Save-Log
 }
 
-Invoke-Cleanup
+# Run only when executed directly. Dot-sourcing (". .\Remove-SynapticsTrojan.ps1")
+# loads the functions without performing any cleanup - the Pester tests rely on
+# this. Exit codes: 0 clean, 1 not admin, 2 findings, 3 errors.
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-Cleanup
+    if     ($script:Stats.ERROR -gt 0) { exit 3 }
+    elseif ($script:Stats.FOUND -gt 0) { exit 2 }
+    else                               { exit 0 }
+}
