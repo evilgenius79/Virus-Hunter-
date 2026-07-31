@@ -1,21 +1,27 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Dedicated removal tool for the "Synaptics.exe" trojan family.
+    Dedicated removal tool for the "Synaptics.exe" (Xred) trojan family and
+    related USB shortcut-worms.
 
 .DESCRIPTION
-    Detects and removes the well-known "Synaptics.exe" malware - an Excel/Office
-    and USB-spreading worm that masquerades as the legitimate Synaptics touchpad
-    driver, hides the victim's real files, persists via the registry, scheduled
-    tasks and the Excel XLSTART folder, and drops itself onto removable drives.
+    Detects and removes the well-known "Synaptics.exe" malware (also known as
+    Xred) - an Excel/Office and USB-spreading worm that masquerades as the
+    legitimate Synaptics touchpad driver, INFECTS other .exe files (keeping the
+    clean original beside them as "._cache_<name>.exe"), hides the victim's real
+    files, persists via the registry, scheduled tasks, WMI subscriptions and the
+    Excel XLSTART folder, and drops itself onto removable drives. It also cleans
+    the generic USB shortcut-worm pattern (hidden folders replaced by decoy .lnk
+    files, hidden script droppers) used by families like Jenxcus and Gamarue.
 
     TRUST MODEL (this is what makes the tool safe AND strong):
       A file matching the malware's names is considered GENUINE only if it carries
-      a *valid Authenticode signature from "Synaptics"*. This is stronger than
-      trusting a file just because it sits in Program Files - it catches malware
-      that drops itself into Program Files, and it avoids destroying a legitimately
-      signed file found elsewhere. The directory C:\Program Files\Synaptics\ is
-      additionally protected: the tool will never delete anything inside it.
+      a *valid Authenticode signature whose subject CN is "Synaptics"*. This is
+      stronger than trusting a file just because it sits in Program Files - it
+      catches malware that drops itself into Program Files, and it avoids
+      destroying a legitimately signed file found elsewhere. The directory
+      C:\Program Files\Synaptics\ is additionally protected: the tool will never
+      delete anything inside it.
 
     Actions performed:
       1. Requires Administrator privileges.
@@ -25,20 +31,25 @@
       4. Removes malicious scheduled tasks and services.
       5. Deletes known malicious folders/files and the executables of the killed
          processes.
-      6. Cleans removable drives: hidden Synaptics*.exe droppers, autorun.inf,
-         and malicious .lnk decoy shortcuts.
-      7. Cleans persistence in the registry: Run, RunOnce, and the Winlogon
-         Shell/Userinit values.
-      8. Removes malicious .lnk files from the Startup folders.
-      9. Cleans the Excel XLSTART folders and repairs the Office macro-security
+      6. Repairs Xred-infected executables: where a clean original was kept as
+         "._cache_<name>.exe", the infected host is replaced by the clean copy.
+      7. Cleans removable drives: unsigned Synaptics*.exe droppers, autorun.inf,
+         decoy .lnk shortcuts, hidden script droppers, and "folder-icon" worm
+         copies named after hidden real folders.
+      8. Cleans persistence in the registry: Run, RunOnce, the HKCU Windows
+         Load/Run values, and the Winlogon Shell/Userinit values.
+      9. Removes malicious .lnk files from the Startup folders.
+     10. Removes malicious WMI event-subscription persistence and IFEO
+         "Debugger" hijacks (others are flagged for manual review).
+     11. Cleans the Excel XLSTART folders and repairs the Office macro-security
          keys (AccessVBOM / VBAWarnings) the worm lowers.
-     10. Removes hosts-file entries that blackhole antivirus / Windows-update
+     12. Removes hosts-file entries that blackhole antivirus / Windows-update
          domains (backing the file up first).
-     11. (Optional) Looks up the SHA256 of detected files on VirusTotal for
+     13. (Optional) Looks up the SHA256 of detected files on VirusTotal for
          confirmation - read-only, requires -VirusTotalApiKey.
-     12. Repairs the Explorer "hide files" settings and un-hides files the worm
+     14. Repairs the Explorer "hide files" settings and un-hides files the worm
          marked Hidden/System.
-     13. Writes a detailed, timestamped text log.
+     15. Writes a detailed, timestamped text log.
 
     SAFETY: Run with -DryRun first. In DryRun mode nothing is changed.
 
@@ -89,8 +100,9 @@ param(
 # The ONLY directory tree the tool refuses to delete from (the real driver).
 $TrustedRoot = Join-Path $env:ProgramFiles 'Synaptics'
 
-# Signer subject that identifies the genuine vendor.
-$TrustedSignerPattern = 'Synaptics'
+# Signer subject that identifies the genuine vendor. Anchored on CN= so a
+# look-alike organisation name elsewhere in the subject cannot satisfy it.
+$TrustedSignerPattern = 'CN=Synaptics'
 
 # Process / file base names this malware family uses.
 $TargetProcessNames = @('Synaptics', 'wszui', 'wszqms', 'wszust')
@@ -113,6 +125,15 @@ $RunKeys = @(
 
 $WinlogonKey = 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon'
 
+# Image File Execution Options roots ("Debugger" value hijack persistence).
+$IFEOKeys = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+)
+
+# Script extensions USB worms drop (hidden) in removable drive roots.
+$WormScriptExtensions = @('.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh', '.bat', '.cmd', '.scr', '.pif')
+
 # The hosts file, and domain fragments malware commonly blackholes to stop
 # antivirus / OS updates. A line that maps one of these to a loopback / null
 # address is treated as a malicious block.
@@ -120,7 +141,7 @@ $HostsFile = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
 $SinkholeAddresses = @('0.0.0.0', '127.0.0.1', '::1', '::')
 $SecurityDomains = @(
     'microsoft.com', 'windowsupdate.com', 'update.microsoft', 'msftncsi.com',
-    'defender', 'mpwsystem',
+    'defender',
     'avast.com', 'avg.com', 'avira', 'bitdefender', 'eset', 'nod32',
     'kaspersky', 'mcafee', 'norton', 'symantec', 'sophos', 'malwarebytes',
     'trendmicro', 'f-secure', 'drweb', 'comodo', 'clamav', 'virustotal.com'
@@ -219,6 +240,18 @@ function Get-ExeFromCommand {
     if ($Command -match '([A-Za-z]:\\[^\s,"]+\.exe)') { return $Matches[1] }
     if ($Command -match '(\S+\.exe)')          { return $Matches[1] }
     return $null
+}
+
+$script:WShell = $null
+function Get-ShortcutCommand {
+    # Resolves a .lnk to "target arguments" using one shared COM object.
+    param([string]$LnkPath)
+    try {
+        if (-not $script:WShell) { $script:WShell = New-Object -ComObject WScript.Shell }
+        $sc = $script:WShell.CreateShortcut($LnkPath)
+        return ("{0} {1}" -f $sc.TargetPath, $sc.Arguments).Trim()
+    }
+    catch { return $null }
 }
 
 function Test-CommandIsMalicious {
@@ -349,7 +382,9 @@ function Stop-MaliciousProcesses {
             }
         }
     }
-    return $suspectPaths
+    # The comma keeps the array intact through PowerShell's pipeline unrolling
+    # (an empty or single-element result would otherwise arrive as $null/string).
+    return ,$suspectPaths.ToArray()
 }
 
 # ----------------------------------------------------------------------------
@@ -410,7 +445,7 @@ function Remove-MaliciousServices {
 # ----------------------------------------------------------------------------
 
 function Remove-MaliciousFiles {
-    param([System.Collections.Generic.List[string]]$ExtraPaths)
+    param([string[]]$ExtraPaths)
     Write-Log "Cleaning up known malicious file/folder locations..." -Level INFO
 
     foreach ($path in $KnownMaliciousPaths) {
@@ -444,10 +479,15 @@ function Clear-RemovableDrives {
         $root = $drive.DeviceID + '\'
         Write-Log "Inspecting removable drive root: $root" -Level INFO
 
-        # 1) Synaptics*.exe droppers in the root.
+        # 1) Synaptics*.exe droppers in the root. A validly signed file (e.g. a
+        #    driver installer the user stored there) is left alone.
         Get-ChildItem -LiteralPath $root -Filter 'Synaptics*.exe' -Force -ErrorAction SilentlyContinue |
             Where-Object { -not $_.PSIsContainer } |
             ForEach-Object {
+                if (Test-IsGenuineSynaptics $_.FullName) {
+                    Write-Log "Validly signed Synaptics file on removable drive left alone: $($_.FullName)" -Level OK
+                    return
+                }
                 $hidden = ($_.Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0
                 Write-Log ("Dropper on removable drive (Hidden={0}): {1}" -f $hidden, $_.FullName) -Level FOUND
                 Remove-ItemSecurely -Path $_.FullName
@@ -460,17 +500,67 @@ function Clear-RemovableDrives {
             Remove-ItemSecurely -Path $autorun
         }
 
-        # 3) Decoy .lnk shortcuts in the root that launch the malware.
+        # 3) Decoy .lnk shortcuts in the root. USB worms replace real folders
+        #    with a hidden copy plus a same-named .lnk that launches the malware
+        #    (Jenxcus/Houdini/Gamarue pattern), so three tests apply: launches
+        #    this family, launches a script host with arguments, or masquerades
+        #    as a hidden sibling of the same name.
         Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Force -ErrorAction SilentlyContinue |
             ForEach-Object {
-                $target = $null
-                try { $target = (New-Object -ComObject WScript.Shell).CreateShortcut($_.FullName).TargetPath } catch {}
-                $args2 = $null
-                try { $args2 = (New-Object -ComObject WScript.Shell).CreateShortcut($_.FullName).Arguments } catch {}
-                $cmd = ("{0} {1}" -f $target, $args2).Trim()
-                if (Test-CommandIsMalicious $cmd) {
-                    Write-Log "Malicious decoy shortcut on removable drive: $($_.FullName) -> '$cmd'" -Level FOUND
+                $cmd = Get-ShortcutCommand $_.FullName
+                if (-not $cmd) { return }
+
+                $isFamily = Test-CommandIsMalicious $cmd
+                $viaScriptHost = ($cmd -match '(^|\\)(wscript|cscript|cmd|mshta|powershell|rundll32)(\.exe)?\s+\S')
+
+                $decoyOfHidden = $false
+                $sibling = Join-Path $root $_.BaseName
+                if (Test-Path -LiteralPath $sibling) {
+                    $sib = Get-Item -LiteralPath $sibling -Force -ErrorAction SilentlyContinue
+                    if ($sib -and (($sib.Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0)) { $decoyOfHidden = $true }
+                }
+
+                if ($isFamily -or $viaScriptHost -or $decoyOfHidden) {
+                    $why = if ($isFamily) { 'launches this malware family' }
+                           elseif ($viaScriptHost) { 'launches a script host with arguments' }
+                           else { 'masquerades as the hidden item of the same name' }
+                    Write-Log "Malicious decoy shortcut on removable drive ($why): $($_.FullName) -> '$cmd'" -Level FOUND
                     Remove-ItemSecurely -Path $_.FullName
+                }
+            }
+
+        # 4) Hidden script droppers in the root. Visible scripts are only
+        #    flagged - they may be the user's own.
+        Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer -and $_.Extension -in $WormScriptExtensions } |
+            ForEach-Object {
+                $isHidden = ($_.Attributes -band ([System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)) -ne 0
+                if ($isHidden) {
+                    Write-Log "Hidden script dropper on removable drive: $($_.FullName)" -Level FOUND
+                    Remove-ItemSecurely -Path $_.FullName
+                }
+                else {
+                    Write-Log "Script file on removable drive root left in place (delete manually if not yours): $($_.FullName)" -Level WARN
+                }
+            }
+
+        # 5) "Folder-icon" worm copies: an .exe named after a sibling folder.
+        #    Removed when either side is hidden (the worm hides the real one);
+        #    flagged otherwise.
+        Get-ChildItem -LiteralPath $root -Filter '*.exe' -Force -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer } |
+            ForEach-Object {
+                $sibDir = Join-Path $root $_.BaseName
+                if (-not (Test-Path -LiteralPath $sibDir -PathType Container)) { return }
+                $dir = Get-Item -LiteralPath $sibDir -Force -ErrorAction SilentlyContinue
+                $dirHidden = $dir -and (($dir.Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0)
+                $exeHidden = ($_.Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0
+                if ($dirHidden -or $exeHidden) {
+                    Write-Log "Folder-masquerade worm copy on removable drive: $($_.FullName) (real folder: $sibDir)" -Level FOUND
+                    Remove-ItemSecurely -Path $_.FullName
+                }
+                else {
+                    Write-Log "Executable named after sibling folder (review manually): $($_.FullName)" -Level WARN
                 }
             }
     }
@@ -504,6 +594,29 @@ function Remove-MaliciousRunKeys {
                     Write-Log "Removed value '$valueName' from $key." -Level OK
                 }
                 catch { Write-Log "FAILED to remove '$valueName' from ${key}: $($_.Exception.Message)" -Level ERROR }
+            }
+        }
+    }
+
+    # 'Load' / 'Run' under the HKCU Windows key: an old but still-abused
+    # autostart most cleaners forget.
+    $windowsKey = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows'
+    if (Test-Path -LiteralPath $windowsKey) {
+        foreach ($vn in @('Load', 'Run')) {
+            $vd = $null
+            try { $vd = [string](Get-ItemProperty -LiteralPath $windowsKey -Name $vn -ErrorAction Stop).$vn } catch { continue }
+            if (-not (Test-CommandIsMalicious $vd)) { continue }
+
+            Write-Log "Malicious '$vn' value in ${windowsKey}: '$vd'" -Level FOUND
+            if ($DryRun) {
+                Write-Log "WOULD remove '$vn' from $windowsKey." -Level ACTION
+            }
+            else {
+                try {
+                    Remove-ItemProperty -LiteralPath $windowsKey -Name $vn -ErrorAction Stop
+                    Write-Log "Removed '$vn' from $windowsKey." -Level OK
+                }
+                catch { Write-Log "FAILED to remove '$vn' from ${windowsKey}: $($_.Exception.Message)" -Level ERROR }
             }
         }
     }
@@ -557,10 +670,8 @@ function Remove-MaliciousStartupShortcuts {
         Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | ForEach-Object {
             $cmd = $_.FullName
             if ($_.Extension -eq '.lnk') {
-                try {
-                    $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($_.FullName)
-                    $cmd = ("{0} {1}" -f $sc.TargetPath, $sc.Arguments).Trim()
-                } catch {}
+                $resolved = Get-ShortcutCommand $_.FullName
+                if ($resolved) { $cmd = $resolved }
             }
             if (Test-CommandIsMalicious $cmd) {
                 Write-Log "Malicious Startup item: $($_.FullName) -> '$cmd'" -Level FOUND
@@ -568,6 +679,156 @@ function Remove-MaliciousStartupShortcuts {
             }
         }
     }
+}
+
+# ----------------------------------------------------------------------------
+# Step 8b - WMI event-subscription persistence
+# ----------------------------------------------------------------------------
+
+function Remove-WmiPersistence {
+    Write-Log "Scanning WMI event subscriptions (root\subscription) for persistence..." -Level INFO
+    $ns = 'root/subscription'
+
+    $consumers = @()
+    foreach ($class in @('CommandLineEventConsumer', 'ActiveScriptEventConsumer')) {
+        try { $consumers += @(Get-CimInstance -Namespace $ns -ClassName $class -ErrorAction Stop) } catch {}
+    }
+    if (-not $consumers) { Write-Log "No command-line / script WMI event consumers present." -Level OK; return }
+
+    $bindings = @(Get-CimInstance -Namespace $ns -ClassName '__FilterToConsumerBinding' -ErrorAction SilentlyContinue)
+
+    foreach ($c in $consumers) {
+        $cmd = if ($c.CimClass.CimClassName -eq 'CommandLineEventConsumer') {
+            ('{0} {1}' -f $c.ExecutablePath, $c.CommandLineTemplate).Trim()
+        } else {
+            ('{0} {1}' -f $c.ScriptFileName, $c.ScriptText).Trim()
+        }
+
+        if (-not (Test-CommandIsMalicious $cmd)) {
+            # Legit software (e.g. SCCM) uses these; only flag, never guess.
+            Write-Log "WMI event consumer left in place (review if unexpected): '$($c.Name)'" -Level INFO
+            continue
+        }
+
+        Write-Log "Malicious WMI event consumer: '$($c.Name)' -> '$cmd'" -Level FOUND
+        if ($DryRun) {
+            Write-Log "WOULD remove WMI consumer '$($c.Name)' with its bindings and filters." -Level ACTION
+            continue
+        }
+        foreach ($b in $bindings) {
+            $bConsumerName = $null
+            try { $bConsumerName = $b.Consumer.Name } catch {}
+            if ($bConsumerName -ne $c.Name) { continue }
+            try {
+                Remove-CimInstance -InputObject $b -ErrorAction Stop
+                if ($b.Filter) { Remove-CimInstance -InputObject $b.Filter -ErrorAction SilentlyContinue }
+                Write-Log "Removed WMI binding/filter for consumer '$($c.Name)'." -Level OK
+            }
+            catch { Write-Log "FAILED to remove WMI binding for '$($c.Name)': $($_.Exception.Message)" -Level ERROR }
+        }
+        try {
+            Remove-CimInstance -InputObject $c -ErrorAction Stop
+            Write-Log "Removed WMI consumer '$($c.Name)'." -Level OK
+        }
+        catch { Write-Log "FAILED to remove WMI consumer '$($c.Name)': $($_.Exception.Message)" -Level ERROR }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Step 8c - Image File Execution Options "Debugger" hijacks
+# ----------------------------------------------------------------------------
+
+function Remove-IFEOHijacks {
+    Write-Log "Scanning Image File Execution Options for Debugger hijacks..." -Level INFO
+    foreach ($base in $IFEOKeys) {
+        if (-not (Test-Path -LiteralPath $base)) { continue }
+        Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | ForEach-Object {
+            $dbg = $null
+            try { $dbg = [string](Get-ItemProperty -LiteralPath $_.PSPath -Name 'Debugger' -ErrorAction Stop).Debugger } catch { return }
+            if ([string]::IsNullOrWhiteSpace($dbg)) { return }
+
+            if (Test-CommandIsMalicious $dbg) {
+                Write-Log "IFEO Debugger hijack on '$($_.PSChildName)': '$dbg'" -Level FOUND
+                if ($DryRun) {
+                    Write-Log "WOULD remove Debugger value from IFEO\$($_.PSChildName)." -Level ACTION
+                }
+                else {
+                    try {
+                        Remove-ItemProperty -LiteralPath $_.PSPath -Name 'Debugger' -ErrorAction Stop
+                        Write-Log "Removed IFEO Debugger for '$($_.PSChildName)'." -Level OK
+                    }
+                    catch { Write-Log "FAILED to remove IFEO Debugger for '$($_.PSChildName)': $($_.Exception.Message)" -Level ERROR }
+                }
+            }
+            else {
+                # Legit uses exist (procdump, gflags) - flag, don't remove.
+                Write-Log "IFEO Debugger present on '$($_.PSChildName)' ('$dbg') - not this family; review manually." -Level WARN
+            }
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Step 8d - Repair Xred-infected executables ("._cache_" clean-copy pairs)
+# ----------------------------------------------------------------------------
+
+function Repair-InfectedExecutables {
+    # The Synaptics/Xred family is also a file INFECTOR: it replaces a host
+    # .exe with itself and keeps the clean original beside it, renamed to
+    # "._cache_<name>.exe". Restoring that copy recovers the user's program
+    # instead of just deleting it.
+    Write-Log "Scanning for infected executables ('._cache_*.exe' clean-copy companions)..." -Level INFO
+
+    $roots = New-Object System.Collections.Generic.List[string]
+    $roots.Add($env:USERPROFILE)
+    if ($ScanRemovableDrives) {
+        Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 2' -ErrorAction SilentlyContinue |
+            ForEach-Object { $roots.Add($_.DeviceID + '\') }
+    }
+
+    $pairs = 0
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        Get-ChildItem -LiteralPath $root -Filter '._cache_*.exe' -File -Recurse -Force -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $pairs++
+                $cachePath    = $_.FullName
+                $originalName = $_.Name.Substring(8)      # strip "._cache_"
+                $hostPath     = Join-Path $_.DirectoryName $originalName
+
+                $hostExists = Test-Path -LiteralPath $hostPath
+                if ($hostExists) {
+                    $hostSig = $null
+                    try { $hostSig = (Get-AuthenticodeSignature -LiteralPath $hostPath -ErrorAction Stop).Status } catch {}
+                    if ($hostSig -eq 'Valid') {
+                        Write-Log "Host '$hostPath' is validly signed (not infected); pair left for manual review." -Level WARN
+                        return
+                    }
+                    Write-Log "Infected executable pair: '$hostPath' (infected) + '$cachePath' (clean original)." -Level FOUND
+                }
+                else {
+                    Write-Log "Orphaned clean copy (host missing): '$cachePath' -> will restore as '$originalName'." -Level FOUND
+                }
+
+                if ($DryRun) {
+                    Write-Log "WOULD restore '$hostPath' from the clean copy '$cachePath'." -Level ACTION
+                    return
+                }
+                try {
+                    if ($hostExists) {
+                        (Get-Item -LiteralPath $hostPath -Force).Attributes = 'Normal'
+                        Remove-Item -LiteralPath $hostPath -Force -ErrorAction Stop
+                    }
+                    (Get-Item -LiteralPath $cachePath -Force).Attributes = 'Normal'
+                    Move-Item -LiteralPath $cachePath -Destination $hostPath -ErrorAction Stop
+                    Write-Log "Restored clean original: $hostPath" -Level OK
+                }
+                catch {
+                    Write-Log "FAILED to restore '$hostPath': $($_.Exception.Message)" -Level ERROR
+                }
+            }
+    }
+    if ($pairs -eq 0) { Write-Log "No '._cache_*.exe' infected pairs found." -Level OK }
 }
 
 # ----------------------------------------------------------------------------
@@ -756,11 +1017,12 @@ function Repair-HostsFile {
 # ----------------------------------------------------------------------------
 
 function Invoke-VirusTotalLookup {
-    param([System.Collections.Generic.IEnumerable[string]]$Paths)
+    param([string[]]$Paths)
     if ([string]::IsNullOrWhiteSpace($VirusTotalApiKey)) { return }
 
     Write-Log "Querying VirusTotal for detected files (informational only)..." -Level INFO
     $seen = New-Object System.Collections.Generic.HashSet[string]
+    $first = $true
 
     foreach ($path in $Paths) {
         if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) { continue }
@@ -768,22 +1030,37 @@ function Invoke-VirusTotalLookup {
         try { $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash } catch { continue }
         if (-not $seen.Add($hash)) { continue }
 
-        try {
-            $resp = Invoke-RestMethod -Method Get `
-                -Uri "https://www.virustotal.com/api/v3/files/$hash" `
-                -Headers @{ 'x-apikey' = $VirusTotalApiKey } `
-                -ErrorAction Stop
-            $stats = $resp.data.attributes.last_analysis_stats
-            $mal = [int]$stats.malicious
-            $total = ([int]$stats.malicious + [int]$stats.suspicious + [int]$stats.undetected + [int]$stats.harmless)
-            Write-Log "VirusTotal: $mal/$total engines flag '$path' (SHA256 $hash)." -Level FOUND
-        }
-        catch {
-            if ($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 404) {
-                Write-Log "VirusTotal: hash for '$path' is unknown to VT (SHA256 $hash)." -Level INFO
+        # Free-tier keys allow 4 requests/minute - pace to stay under it.
+        if (-not $first) { Start-Sleep -Seconds 16 }
+        $first = $false
+
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                $resp = Invoke-RestMethod -Method Get `
+                    -Uri "https://www.virustotal.com/api/v3/files/$hash" `
+                    -Headers @{ 'x-apikey' = $VirusTotalApiKey } `
+                    -ErrorAction Stop
+                $stats = $resp.data.attributes.last_analysis_stats
+                $mal = [int]$stats.malicious
+                $total = ([int]$stats.malicious + [int]$stats.suspicious + [int]$stats.undetected + [int]$stats.harmless)
+                Write-Log "VirusTotal: $mal/$total engines flag '$path' (SHA256 $hash)." -Level FOUND
+                break
             }
-            else {
-                Write-Log "VirusTotal lookup failed for '$path': $($_.Exception.Message)" -Level WARN
+            catch {
+                $status = $null
+                try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+                if ($status -eq 404) {
+                    Write-Log "VirusTotal: hash for '$path' is unknown to VT (SHA256 $hash)." -Level INFO
+                    break
+                }
+                elseif ($status -eq 429 -and $attempt -eq 1) {
+                    Write-Log "VirusTotal rate limit hit - waiting 60s and retrying once..." -Level WARN
+                    Start-Sleep -Seconds 60
+                }
+                else {
+                    Write-Log "VirusTotal lookup failed for '$path': $($_.Exception.Message)" -Level WARN
+                    break
+                }
             }
         }
     }
@@ -817,9 +1094,12 @@ function Invoke-Cleanup {
     Invoke-VirusTotalLookup -Paths $vtTargets
 
     Remove-MaliciousFiles -ExtraPaths $suspectPaths
+    Repair-InfectedExecutables
     Clear-RemovableDrives
     Remove-MaliciousRunKeys
     Remove-MaliciousStartupShortcuts
+    Remove-WmiPersistence
+    Remove-IFEOHijacks
     Clear-OfficePersistence
     Repair-HostsFile
     Repair-HiddenFileSettings

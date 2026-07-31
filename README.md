@@ -1,17 +1,24 @@
 # Synaptics.exe Trojan Removal Tool
 
-A defensive PowerShell remediation script for the **"Synaptics.exe" trojan** — a
-malware family that disguises itself as the legitimate Synaptics touchpad driver,
-spreads via USB drives and infected Office documents, hides your real files, and
-adds itself to Windows startup.
+A defensive PowerShell remediation script for the **"Synaptics.exe" trojan**
+(also known as **Xred**) — a malware family that disguises itself as the
+legitimate Synaptics touchpad driver, **infects your other programs** (keeping
+the clean original beside them as `._cache_<name>.exe`), spreads via USB drives
+and infected Office documents, hides your real files, and adds itself to Windows
+startup. It also cleans the **generic USB shortcut-worm pattern** (hidden
+folders replaced by decoy `.lnk` files, hidden script droppers) used by families
+like Jenxcus/Houdini and Gamarue.
 
 > **How it decides what's malicious (trust model):** a file matching the
 > malware's names is treated as **genuine only if it carries a valid
-> Authenticode signature from "Synaptics."** This is stronger than trusting a
-> file just because it lives in `C:\Program Files\Synaptics\` — it catches
-> malware that drops *into* Program Files, and avoids deleting a legitimately
-> signed file found elsewhere. As an extra guard, the tool will **never delete**
-> anything inside `C:\Program Files\Synaptics\`.
+> Authenticode signature whose subject CN is "Synaptics."** This is stronger
+> than trusting a file just because it lives in `C:\Program Files\Synaptics\` —
+> it catches malware that drops *into* Program Files, and avoids deleting a
+> legitimately signed file found elsewhere. As an extra guard, the tool will
+> **never delete** anything inside `C:\Program Files\Synaptics\`.
+> Where a heuristic isn't certain (visible scripts on a USB root, unfamiliar
+> WMI consumers or IFEO debuggers), the tool **flags for manual review instead
+> of deleting**.
 
 ## What it does
 
@@ -20,27 +27,37 @@ adds itself to Windows startup.
    back if needed.
 3. **Finds and kills** `Synaptics` / `wszui` / `wszqms` / `wszust` processes that
    are *not* validly signed by Synaptics.
-4. **Removes persistence** beyond the basics:
+4. **Repairs infected programs** — where Xred wrapped one of your `.exe` files
+   and kept the clean original as `._cache_<name>.exe`, the infected file is
+   replaced with the clean copy, so you get your program back instead of losing
+   it.
+5. **Removes persistence** beyond the basics:
    - Malicious **scheduled tasks** and **services**.
-   - Registry **`Run` and `RunOnce`** entries under `HKCU` and `HKLM`.
+   - Registry **`Run` / `RunOnce`** entries under `HKCU` and `HKLM`, plus the
+     old **`Load` / `Run`** values under the HKCU Windows key.
    - Hijacked **Winlogon** `Shell` / `Userinit` values (repaired to defaults).
    - Malicious **Startup-folder** shortcuts.
-5. **Cleans the Office/Excel infection vector** — removes malicious files from
+   - Malicious **WMI event subscriptions** and **IFEO "Debugger"** hijacks
+     (unfamiliar but non-family ones are flagged for review, not removed).
+6. **Cleans the Office/Excel infection vector** — removes malicious files from
    the **XLSTART** folders and resets the macro-security keys (`AccessVBOM`,
    `VBAWarnings`) the worm lowers. Without this, Excel can reinfect the machine.
-6. **Cleans removable (USB) drives** — hidden `Synaptics*.exe` droppers,
-   `autorun.inf`, and malicious `.lnk` decoy shortcuts.
-7. **Deletes** the known malicious folders/files and the executables of the
+7. **Cleans removable (USB) drives** — unsigned `Synaptics*.exe` droppers,
+   `autorun.inf`, decoy `.lnk` shortcuts (including ones masquerading as your
+   hidden folders or launching script hosts), hidden script droppers, and
+   "folder-icon" worm copies named after real folders.
+8. **Deletes** the known malicious folders/files and the executables of the
    processes it terminated.
-8. **Repairs the hosts file** — removes entries that blackhole antivirus or
+9. **Repairs the hosts file** — removes entries that blackhole antivirus or
    Windows-update domains (a backup of the original is saved first).
-9. **(Optional) Confirms via VirusTotal** — with `-VirusTotalApiKey`, looks up
-   the SHA256 of each detected file and logs its detection ratio. Read-only; it
-   never changes what the tool deletes.
-10. **Repairs Explorer** so hidden files and extensions show again, then
+10. **(Optional) Confirms via VirusTotal** — with `-VirusTotalApiKey`, looks up
+    the SHA256 of each detected file and logs its detection ratio. Read-only; it
+    never changes what the tool deletes, and it paces requests to respect the
+    free-tier rate limit.
+11. **Repairs Explorer** so hidden files and extensions show again, then
     **un-hides** files the malware marked Hidden/System (it only clears the
     attributes — it never deletes your data).
-11. **Writes a detailed log** to your Desktop.
+12. **Writes a detailed log** to your Desktop.
 
 ## How to run it safely (step by step for a layperson)
 
